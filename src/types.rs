@@ -161,6 +161,15 @@ pub struct Problem {
     /// See <https://www.rfc-editor.org/rfc/rfc8555#section-6.7.1>
     #[serde(default)]
     pub subproblems: Vec<Subproblem>,
+    /// The `Retry-After` header value from the HTTP response, if present
+    ///
+    /// This is not part of the ACME problem document itself, but is extracted
+    /// from the HTTP headers when the ACME server includes it in error responses.
+    /// It indicates when the client should retry the request.
+    ///
+    /// See <https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3>
+    #[serde(skip)]
+    pub retry_after: Option<String>,
 }
 
 impl Problem {
@@ -170,10 +179,20 @@ impl Problem {
 
     pub(crate) async fn from_response(rsp: BytesResponse) -> Result<Bytes, Error> {
         let status = rsp.parts.status;
+        let retry_after = rsp
+            .parts
+            .headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         let body = rsp.body().await.map_err(Error::Other)?;
         match status.is_informational() || status.is_success() || status.is_redirection() {
             true => Ok(body),
-            false => Err(serde_json::from_slice::<Self>(&body)?.into()),
+            false => {
+                let mut problem = serde_json::from_slice::<Self>(&body)?;
+                problem.retry_after = retry_after;
+                Err(problem.into())
+            }
         }
     }
 }
