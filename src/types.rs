@@ -85,7 +85,7 @@ impl From<&'static str> for Error {
 /// the account credentials to a file or secret manager and restore the
 /// account from persistent storage.
 #[must_use]
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct AccountCredentials {
     pub(crate) id: String,
     /// Stored in DER, serialized as base64
@@ -161,6 +161,15 @@ pub struct Problem {
     /// See <https://www.rfc-editor.org/rfc/rfc8555#section-6.7.1>
     #[serde(default)]
     pub subproblems: Vec<Subproblem>,
+    /// The `Retry-After` header value from the HTTP response, if present
+    ///
+    /// This is not part of the ACME problem document itself, but is extracted
+    /// from the HTTP headers when the ACME server includes it in error responses.
+    /// It indicates when the client should retry the request.
+    ///
+    /// See <https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3>
+    #[serde(skip)]
+    pub retry_after: Option<String>,
 }
 
 impl Problem {
@@ -170,10 +179,20 @@ impl Problem {
 
     pub(crate) async fn from_response(rsp: BytesResponse) -> Result<Bytes, Error> {
         let status = rsp.parts.status;
+        let retry_after = rsp
+            .parts
+            .headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         let body = rsp.body().await.map_err(Error::Other)?;
         match status.is_informational() || status.is_success() || status.is_redirection() {
             true => Ok(body),
-            false => Err(serde_json::from_slice::<Self>(&body)?.into()),
+            false => {
+                let mut problem = serde_json::from_slice::<Self>(&body)?;
+                problem.retry_after = retry_after;
+                Err(problem.into())
+            }
         }
     }
 }
@@ -1236,5 +1255,57 @@ mod tests {
         let window = info.suggested_window;
         assert_eq!(window.start.day(), 2);
         assert_eq!(window.end.day(), 3);
+    }
+
+    #[tokio::test]
+    async fn problem_extracts_retry_after_header() {
+        use bytes::Bytes;
+        use http::response::Builder;
+        use http::StatusCode;
+
+        // Create a mock error response with Retry-After header
+        let problem_json = r#"{
+            "type": "urn:ietf:params:acme:error:rateLimited",
+            "detail": "Too many requests",
+            "status": 429
+        }"#;
+
+        let response = Builder::new()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("retry-after", "120")
+            .body(problem_json)
+            .unwrap();
+
+        let (parts, body) = response.into_parts();
+        let body_bytes = Bytes::from(body);
+
+        // Create a mock BytesBody
+        struct MockBody(Option<Bytes>);
+        #[async_trait::async_trait]
+        impl crate::BytesBody for MockBody {
+            async fn into_bytes(&mut self) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync + 'static>> {
+                Ok(self.0.take().unwrap())
+            }
+        }
+
+        let bytes_response = BytesResponse {
+            parts,
+            body: Box::new(MockBody(Some(body_bytes))),
+        };
+
+        // Call from_response which should extract the header
+        let result = Problem::from_response(bytes_response).await;
+
+        // Should be an error
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+
+        // Extract the Problem from the error
+        if let Error::Api(problem) = err {
+            assert_eq!(problem.detail, Some("Too many requests".to_string()));
+            assert_eq!(problem.retry_after, Some("120".to_string()));
+        } else {
+            panic!("Expected Error::Api, got {:?}", err);
+        }
     }
 }
